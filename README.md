@@ -1,5 +1,5 @@
 # changgun's_src
-changgun's source\n
+changgun's source
 
 
 Hello world!!
