@@ -42,7 +42,7 @@ double pre_cylinder_est_x =  0;
 double pre_cylinder_est_z1 =  0;
 double pre_cylinder_est_x1 =  0;
 
-ros::Publisher pub, vis_pub;
+ros::Publisher pub, wp_pub;
 
 std::ofstream mytxtfile;
 
@@ -301,6 +301,8 @@ cloud_cb (const sensor_msgs::PointCloud2ConstPtr& input)
        pre_cylinder_est_x1 =  cylinder_est_x[a];//count;
 
        gen_centerpoint(cylinder_est_z1,cylinder_est_x1,cylinder_est_z2,cylinder_est_x2);
+
+       // wp_pub.publish ();
 
        // Convert to ROS data type
        sensor_msgs::PointCloud2 output;
