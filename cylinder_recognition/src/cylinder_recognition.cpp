@@ -1,0 +1,351 @@
+#include <ros/ros.h>
+#include <limits>
+#include <visualization_msgs/Marker.h>
+#include <iostream>
+#include <fstream>
+// PCL specific includes
+#include <sensor_msgs/PointCloud2.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/conversions.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl/filters/filter.h>
+#include <pcl/kdtree/kdtree.h>
+#include <pcl/kdtree/kdtree_flann.h>
+
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/filters/radius_outlier_removal.h>
+
+#include <pcl/ModelCoefficients.h>
+#include <pcl/sample_consensus/method_types.h>
+#include <pcl/sample_consensus/model_types.h>
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/filters/extract_indices.h>
+#include <pcl/features/normal_3d.h>
+
+double cylinder_x[1500] ={0};
+double cylinder_y[1500] ={0};
+double cylinder_z[1500] ={0};
+int cylinder_count[1500] = {0};
+double cylinder_est_z[1500] = {0};
+double cylinder_est_x[1500] = {0};
+double cylinder_est_z1 = 0;
+double cylinder_est_x1 = 0;
+double cylinder_est_z2 = 0;
+double cylinder_est_x2 = 0;
+
+double pre_cylinder_est_z =  0;
+double pre_cylinder_est_x =  0;
+double pre_cylinder_est_z1 =  0;
+double pre_cylinder_est_x1 =  0;
+
+ros::Publisher pub, vis_pub;
+
+std::ofstream mytxtfile;
+
+typedef pcl::PointXYZ PointT;
+
+
+double gen_centerpoint(double z1,double x1,double z2,double x2)
+{
+  if(z1 == 0 && x1 == 0 && z2 == 0 && x2 == 0  )
+  {
+    ROS_ERROR("center is not calculated");
+  }
+  else
+  {
+    double center_z,center_x,slop,normal_slop;
+    center_z = (z1+z2)/2;
+    center_x = (x1+x2)/2;
+    slop = (x2-x1)/(z2-z1);
+    normal_slop = -1/slop;
+
+    ROS_ERROR("--------------------------------------");
+    ROS_ERROR("center(z,x) :[%f, %f]",center_z,center_x);
+    ROS_ERROR("slop : [%f], normal_slop : [%f]",slop, normal_slop);
+    ROS_ERROR("--------------------------------------");
+    return(center_z,center_x,normal_slop);
+  }
+}
+
+void
+cloud_cb (const sensor_msgs::PointCloud2ConstPtr& input)
+{
+    // Container for original & filtered data
+    pcl::PointCloud<PointT> cloud;
+    pcl::PointCloud<PointT>::Ptr cloud_filtered_vg (new pcl::PointCloud<PointT>);
+    pcl::PointCloud<PointT>::Ptr cloud_filtered_pass (new pcl::PointCloud<PointT>);
+    pcl::PointCloud<PointT>::Ptr cloud_filtered_sor (new pcl::PointCloud<PointT>);
+    // pcl::PointCloud<PointT>::Ptr cloud_filtered_RMNAN (new pcl::PointCloud<PointT>);
+
+
+    pcl::PointCloud<pcl::Normal>::Ptr cloud_normals (new pcl::PointCloud<pcl::Normal>);
+    pcl::PointCloud<pcl::Normal>::Ptr cloud_normals_obj (new pcl::PointCloud<pcl::Normal>);
+    pcl::PointCloud<PointT>::Ptr plane_extracted_cloud (new pcl::PointCloud<PointT>);
+    pcl::ModelCoefficients::Ptr coefficients_plane (new pcl::ModelCoefficients);
+    pcl::ModelCoefficients::Ptr coefficients_obj (new pcl::ModelCoefficients);
+    pcl::PointIndices::Ptr inliers_plane (new pcl::PointIndices);
+    pcl::PointIndices::Ptr inliers_obj (new pcl::PointIndices);
+
+    // Create a KD-Tree
+    pcl::search::KdTree<PointT>::Ptr tree (new pcl::search::KdTree<PointT>);
+
+    // Output has the PointNormal type in order to store the normals calculated by MLS
+    // pcl::PointCloud<pcl::PointNormal> mls_points;
+
+    pcl::fromROSMsg (*input, cloud);
+
+    // Perform the actual filtering
+    pcl::VoxelGrid<PointT> vg;
+    vg.setInputCloud (cloud.makeShared());
+    vg.setLeafSize (0.04, 0.04, 0.04);
+    vg.filter (*cloud_filtered_vg);
+
+    std::cout << "PointCloud after filtering(VoxelGrid) has: " << cloud_filtered_vg->points.size ()  << " data points." << std::endl;
+
+    // Create the filtering object
+    pcl::PassThrough<PointT> pass;
+    pass.setInputCloud (cloud_filtered_vg);
+    pass.setFilterFieldName ("z");
+    pass.setFilterLimits (0.5, 3);
+    //pass.setFilterLimitsNegative (true);
+    pass.filter (*cloud_filtered_pass);
+
+    std::cout << "PointCloud after filtering(PassThrough) has: " << cloud_filtered_pass->points.size ()  << " data points." << std::endl;
+
+    pcl::NormalEstimation<PointT, pcl::Normal> ne;
+    // Estimate point normals
+    ne.setSearchMethod (tree);
+    ne.setInputCloud (cloud_filtered_pass);
+    ne.setKSearch (10);
+    ne.compute (*cloud_normals);
+
+    // Create the segmentation object
+    pcl::SACSegmentationFromNormals<PointT, pcl::Normal> seg;
+    // Optional
+    seg.setOptimizeCoefficients (true);
+    // Mandatory
+    seg.setModelType (pcl::SACMODEL_NORMAL_PLANE);
+    seg.setNormalDistanceWeight (0.1);
+    seg.setMethodType (pcl::SAC_RANSAC);
+    seg.setDistanceThreshold (0.05);
+    seg.setInputCloud (cloud_filtered_pass);
+    seg.setInputNormals (cloud_normals);
+    seg.segment (*inliers_plane, *coefficients_plane);
+
+    pcl::ExtractIndices<PointT> extract;
+    // Extract the planar inliers from the input cloud
+    extract.setInputCloud (cloud_filtered_pass);
+    extract.setIndices (inliers_plane);
+    extract.setNegative (false);
+
+    pcl::PointCloud<PointT>::Ptr cloud_plane (new pcl::PointCloud<PointT> ());
+    extract.filter (*cloud_plane);
+    //std::cerr << "PointCloud representing the planar component: " << cloud_plane->points.size () << " data points." << std::endl;
+
+    // Remove the planar inliers, extract the rest
+    extract.setNegative (true);
+    extract.filter (*plane_extracted_cloud);
+
+    pcl::ExtractIndices<pcl::Normal> extract_normals;
+    extract_normals.setNegative (true);
+    extract_normals.setInputCloud (cloud_normals);
+    extract_normals.setIndices (inliers_plane);
+    extract_normals.filter (*cloud_normals_obj);
+
+    pcl::SACSegmentationFromNormals<PointT, pcl::Normal> seg2;
+    // Create the segmentation object for cylinder segmentation and set all the parameters
+    seg2.setOptimizeCoefficients (true);
+    seg2.setModelType (pcl::SACMODEL_CYLINDER);
+    seg2.setMethodType (pcl::SAC_RANSAC);
+    seg2.setNormalDistanceWeight (0.1);
+    seg2.setMaxIterations (5);
+    seg2.setDistanceThreshold (0.55);
+    seg2.setRadiusLimits (0.35, 0.5);
+    seg2.setInputCloud (plane_extracted_cloud);
+    seg2.setInputNormals (cloud_normals_obj);
+
+    // Obtain the cylinder inliers and coefficients
+    seg2.segment (*inliers_obj, *coefficients_obj);
+    //std::cerr << "Cylinder coefficients: " << *coefficients_cylinder << std::endl;
+
+    pcl::ExtractIndices<PointT> extract2;
+    // Write the cylinder inliers to disk
+    extract2.setInputCloud (plane_extracted_cloud);
+    extract2.setIndices (inliers_obj);
+    extract2.setNegative (false);
+    pcl::PointCloud<PointT>::Ptr cloud_obj (new pcl::PointCloud<PointT> ());
+    extract2.filter (*cloud_obj);
+
+    // Create the filtering object
+    pcl::StatisticalOutlierRemoval<PointT> sor;
+    sor.setInputCloud (cloud_obj);
+    sor.setMeanK (10);           //The number of neighbors to analyze for each point is set to 50
+    sor.setStddevMulThresh (1.0); //the standard deviation multiplier to 1
+    sor.filter (*cloud_filtered_sor);
+
+    std::cout << "PointCloud after filtering(StatisticalOutlierRemoval) has: " << cloud_filtered_sor->points.size ()  << " data points." << std::endl;
+
+   if(cloud_filtered_sor->points.size () <= 1500)
+   {
+    if(cloud_filtered_sor->points.size () != 0)
+    {
+        cylinder_est_z[1000] ={0};
+        cylinder_est_x[1000] ={0};
+
+    for (size_t i = 0; i < cloud_filtered_sor->points.size (); ++i)
+    {
+        cylinder_x[i] = cloud_filtered_sor->points[i].x;
+        cylinder_y[i] = cloud_filtered_sor->points[i].y;
+        cylinder_z[i] = cloud_filtered_sor->points[i].z;
+    }
+
+    double dist =0;
+
+    for(int j =0; j < cloud_filtered_sor->points.size() ; j++)
+    {
+        cylinder_count[j] =0;
+        for(int k =0; k < cloud_filtered_sor->points.size() ; k++)
+        {
+            dist = sqrt((cylinder_z[j] - cylinder_z[k])*(cylinder_z[j] - cylinder_z[k]) +(cylinder_x[j] - cylinder_x[k])*(cylinder_x[j] - cylinder_x[k]));
+
+            if(dist < 0.05)
+            {
+              cylinder_count[j] = cylinder_count[j] + 1;
+              //ROS_ERROR("cylinder_count[%d] = %d", j, cylinder_count[j]);
+            }
+        }
+         //ROS_ERROR("cylinder_count[%d] = %d", j, cylinder_count[j]);
+         //ROS_ERROR("Cylinder_raw(z,x):[%f, %f]",cylinder_z[j], cylinder_x[j]);
+    }
+
+    int c = 0;
+    for(int j = 1; j < cloud_filtered_sor->points.size(); j++)
+    {
+        if(cylinder_count[c] > cylinder_count[j])
+        {
+            cylinder_est_z[c] = cylinder_z[c];
+            cylinder_est_x[c] = cylinder_x[c];
+        }
+        else
+        {
+            cylinder_est_z[j] = cylinder_z[j];
+            cylinder_est_x[j] = cylinder_x[j];
+            c = j;
+        }
+    }
+
+    if(cylinder_est_z[c] == 0 || cylinder_est_x[c] == 0)
+    {
+        cylinder_est_z[c] = pre_cylinder_est_z;
+        cylinder_est_x[c] = pre_cylinder_est_x;
+    }
+
+    ROS_ERROR("Cylinder(z,x):[%f, %f]",cylinder_est_z[c], cylinder_est_x[c]);
+
+    mytxtfile << cylinder_est_z[c] <<","<< cylinder_est_x[c]<<",";
+
+    cylinder_est_z1 =  cylinder_est_z[c];//count;
+    cylinder_est_x1 =  cylinder_est_x[c];//count;
+
+    pre_cylinder_est_z =  0;
+    pre_cylinder_est_x =  0;
+
+    pre_cylinder_est_z =  cylinder_est_z[c];//count;
+    pre_cylinder_est_x =  cylinder_est_x[c];//count;
+
+
+
+    int a = 0;
+    int dist2 = 0;
+
+    for(int i = 1; i < cloud_filtered_sor->points.size(); i++)
+    {
+        dist2 = sqrt((cylinder_z[c] - cylinder_z[i])*(cylinder_z[c] - cylinder_z[i]) +(cylinder_x[c] - cylinder_x[i])*(cylinder_x[c] - cylinder_x[i]));
+
+       if(dist2 >0.9 && dist2 < 1.1)
+       {
+               if(cylinder_count[a] > cylinder_count[i])
+               {
+                   cylinder_est_z[a] = cylinder_z[a];
+                   cylinder_est_x[a] = cylinder_x[a];
+               }
+               else
+               {
+                   cylinder_est_z[i] = cylinder_z[i];
+                   cylinder_est_x[i] = cylinder_x[i];
+                   a = i;
+               }
+        }
+     }
+
+       if(cylinder_est_z[a] == 0 || cylinder_est_x[a] == 0)
+       {
+         cylinder_est_z[a] = pre_cylinder_est_z1;
+         cylinder_est_x[a] = pre_cylinder_est_x1;
+       }
+
+       ROS_ERROR("Cylinder1(z,x):[%f, %f]",cylinder_est_z[a], cylinder_est_x[a]);
+       mytxtfile << cylinder_est_z[a]<<","<<cylinder_est_x[a] <<std::endl;
+
+       cylinder_est_z2 =  cylinder_est_z[a];//count;
+       cylinder_est_x2 =  cylinder_est_x[a];//count;
+
+       pre_cylinder_est_z1 =  0;
+       pre_cylinder_est_x1 =  0;
+
+       pre_cylinder_est_z1 =  cylinder_est_z[a];//count;
+       pre_cylinder_est_x1 =  cylinder_est_x[a];//count;
+
+       gen_centerpoint(cylinder_est_z1,cylinder_est_x1,cylinder_est_z2,cylinder_est_x2);
+
+       // Convert to ROS data type
+       sensor_msgs::PointCloud2 output;
+       pcl::toROSMsg(*cloud_filtered_sor, output);
+       output.header.frame_id = "camera_depth_optical_frame";
+       // Publish the data
+       pub.publish (output);
+    }
+  }
+    else
+    {
+        // Convert to ROS data type
+        sensor_msgs::PointCloud2 output;
+        pcl::toROSMsg(*cloud_filtered_sor, output);
+        output.header.frame_id = "camera_depth_optical_frame";
+        // Publish the data
+        pub.publish (output);
+    }
+
+}
+
+
+int
+main (int argc, char** argv)
+{
+  // Initialize ROS
+  ros::init (argc, argv, "cylinder_recognition");
+  ros::NodeHandle nh;
+
+  mytxtfile.open ("test.txt");
+  //mytxtfile << "1st z, 1st x, 2nd z, 2nd x " <<std::endl;
+  // Create a ROS subscriber for the input point cloud
+  ros::Subscriber sub = nh.subscribe ("/camera/depth_registered/points", 1, cloud_cb);
+  // ros::Subscriber sub = nh.subscribe ("/camera/depth/color/points", 1, cloud_cb);
+
+  // Create a ROS publisher for the output point cloud
+  pub = nh.advertise<sensor_msgs::PointCloud2> ("cylinder_recognition", 100);
+  // vis_pub = nh.advertise<visualization_msgs::Marker>( "visualization_marker", 0 );
+
+  // Spin
+  //ros::spinOnce();
+  ros::spin ();
+  if(ros::ok()==0)
+  {
+    mytxtfile.close();
+  }
+
+}
